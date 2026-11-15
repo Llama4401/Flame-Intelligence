@@ -28,7 +28,7 @@ export default async (req) => {
   const prompt = String((body && body.prompt) || "");
   if (!prompt || prompt.length > 80000) return json({ error: "Prompt is missing or too long." }, 400);
 
-  const model = process.env.AI_MODEL || (provider === "anthropic" ? "claude-sonnet-5-5" : "gemini-2.5-flash");
+  const model = process.env.AI_MODEL || (provider === "anthropic" ? "claude-sonnet-5-5" : "gemini-3.8-flash");
 
   try {
     let text = "";
@@ -42,17 +42,35 @@ export default async (req) => {
       if (!r.ok) return json({ error: (data.error && data.error.message) || `AI provider error ${r.status}` }, r.status === 429 ? 429 : 502);
       text = (data.content || []).map((b) => b.text || "").join("");
     } else {
-      const generationConfig = { maxOutputTokens: 1500, temperature: 0.2 };
-      if (/flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: "POST",
-        headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig }),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) return json({ error: (data.error && data.error.message) || `AI provider error ${r.status}` }, r.status === 429 ? 429 : 502);
-      text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
-        .map((p) => p.text || "").join("");
+      // Google retires model names over time. Try the configured one first, then newer names.
+      const candidates = [process.env.AI_MODEL, "gemini-3.8-flash", "gemini-flash-latest"].filter(Boolean);
+      const tried = [...new Set(candidates)];
+      let lastError = "No Gemini model could be reached.";
+      let lastStatus = 502;
+      for (const m of tried) {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+          method: "POST",
+          headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 4000, temperature: 0.2 },
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (r.ok) {
+          text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
+            .map((p) => p.text || "").join("");
+          if (text.trim()) break;
+          lastError = "The AI returned an empty answer. Try again.";
+          continue;
+        }
+        lastError = (data.error && data.error.message) || `AI provider error ${r.status}`;
+        lastStatus = r.status === 429 ? 429 : 502;
+        // Only move on to the next model name when the problem is the model itself.
+        const modelProblem = r.status === 404 || /no longer available|not found|not supported|deprecated/i.test(lastError);
+        if (!modelProblem) break;
+      }
+      if (!text.trim()) return json({ error: lastError }, lastStatus);
     }
     if (!text.trim()) return json({ error: "The AI returned an empty answer. Try again." }, 502);
     return json({ text });
