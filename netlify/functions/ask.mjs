@@ -47,19 +47,32 @@ export default async (req) => {
       const tried = [...new Set(candidates)];
       let lastError = "No Gemini model could be reached.";
       let lastStatus = 502;
+      // Netlify stops a function after about 30 seconds, so stay well inside that.
+      const deadline = Date.now() + 25000;
       for (const m of tried) {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
-          method: "POST",
-          headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 4000, temperature: 0.2 },
-          }),
-        });
+        const left = deadline - Date.now();
+        if (left < 3000) break;
+        let r;
+        try {
+          r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+            method: "POST",
+            headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: prompt }] }],
+              // "low" thinking keeps answers fast enough for a web page.
+              generationConfig: { maxOutputTokens: 4000, thinkingConfig: { thinkingLevel: "low" } },
+            }),
+            signal: AbortSignal.timeout(Math.min(left, 20000)),
+          });
+        } catch (e) {
+          lastError = `Google did not answer in time (model ${m}). Try again in a moment.`;
+          lastStatus = 504;
+          continue;
+        }
         const data = await r.json().catch(() => ({}));
         if (r.ok) {
           text = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
-            .map((p) => p.text || "").join("");
+            .filter((p) => !p.thought).map((p) => p.text || "").join("");
           if (text.trim()) break;
           lastError = "The AI returned an empty answer. Try again.";
           continue;
@@ -67,7 +80,7 @@ export default async (req) => {
         lastError = (data.error && data.error.message) || `AI provider error ${r.status}`;
         lastStatus = r.status === 429 ? 429 : 502;
         // Only move on to the next model name when the problem is the model itself.
-        const modelProblem = r.status === 404 || /no longer available|not found|not supported|deprecated/i.test(lastError);
+        const modelProblem = r.status === 404 || /no longer available|not found|not supported|deprecated|thinking/i.test(lastError);
         if (!modelProblem) break;
       }
       if (!text.trim()) return json({ error: lastError }, lastStatus);
